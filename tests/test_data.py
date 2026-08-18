@@ -1,30 +1,10 @@
-import json
-
-import torch
-
-from dsflow.audio import save_wav
 from dsflow.config import DataConfig
 from dsflow.data import MelDataset, collate_mel, preprocess_ljspeech, proportional_durations
 from dsflow.text import TextTokenizer
 
 
-def make_fake_ljspeech(root, n=4):
-    wavs = root / "LJSpeech-1.1" / "wavs"
-    wavs.mkdir(parents=True, exist_ok=True)
-    rows = []
-    for i in range(n):
-        fid = f"LJ00{i+1}_001"
-        seconds = 1.0 + 0.5 * i
-        wave = torch.randn(int(22050 * seconds)) * 0.1 + 0.2 * torch.sin(
-            torch.linspace(0, 2 * 3.14159 * 220 * seconds, int(22050 * seconds))
-        )
-        save_wav(wavs / f"{fid}.wav", wave, 22050)
-        rows.append(f"{fid}|fake|sentence number {i+1}.")
-    (root / "LJSpeech-1.1" / "metadata.csv").write_text("\n".join(rows) + "\n")
-
-
-def test_preprocess_and_dataset(tmp_path):
-    make_fake_ljspeech(tmp_path)
+def test_preprocess_and_dataset(fake_ljspeech):
+    tmp_path = fake_ljspeech
     cfg = DataConfig(
         data_root=str(tmp_path),
         ljspeech_dir=str(tmp_path / "LJSpeech-1.1"),

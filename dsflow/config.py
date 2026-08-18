@@ -42,6 +42,7 @@ class ModelConfig:
     ff_mult: int = 4
     max_seq_len: int = 4096
     step_dropout: float = 0.1
+    dropout: float = 0.1
 
 
 @dataclass
