@@ -105,6 +105,23 @@ python -m dsflow.infer --ckpt checkpoints/last.pt --text "..." --out outputs/mul
 
 说明：2000 步仅为流水线验证。单步 x0 头此时重建相关性（0.39）低于多步（0.60），继续训练（建议 ≥ 50k 步并配合 EMA/更长 step-dropout 曝光）会进一步收敛，这也是本仓库留给后续工作的主线。
 
+## Chatterbox S3Gen 单步化（2026-08-18）
+
+把 [ResembleAI/chatterbox](https://huggingface.co/ResembleAI/chatterbox)（HF 上 AXERA-TECH 板端部署对应的 S3Gen 流匹配声码器）从 **10 步 Euler 蒸馏成 1 步**：
+
+- **目标**：官方 S3Gen 用 `CausalConditionalCFM` 以 10 步 Euler（余弦时间表 + CFG 双 batch 混合）把 S3 语音 token 解码为 mel。
+- **方法**（DSFlow 思路移植）：学生共享主干、双输出头（速度头继承教师权重 + 新增零初始化直接头）；每步采新鲜噪声 z，教师 5 步 ODE 端点作 reflow 目标；双监督 = CFM MSE + 直接 L1；step dropout 把 t 置 0（S3Gen 约定 t=0=纯噪声，即单步输入）。
+- **验证**（留出 20 句）：教师 10 步 corr 0.887 / L1 0.784 / 0.41s；教师直接 1 步 corr 0.870 / L1 1.228；**学生 1 步 corr 0.891 / L1 0.691 / 0.062s**（vocoder ~6.6x、端到端 TTS ~13x 加速）。
+- **复现**：
+  ```bash
+  pip install --no-deps git+https://github.com/Resemble-AI/chatterbox.git@master
+  pip install -r requirements-chatterbox.txt
+  python -m dsflow.chatterbox.distill --fresh-z --steps 2000 --step-dropout 0.5 --lambda-direct 1.5 --teacher-steps 5
+  python -m dsflow.chatterbox.eval --student-ckpt checkpoints/chatterbox/last.pt
+  python -m dsflow.chatterbox.demo_tts   # 端到端：教师 10 步 vs 学生 1 步 WAV
+  ```
+- **已知限制**：学生单步 mel 指标优于教师，但经 HiFT 合成时整体响度偏低（demo 已做响度归一化）；阶段 2（ONNX/AXMODEL 上板）待验证通过后另行开展。
+
 ## Repository layout
 
 ```text
@@ -126,6 +143,8 @@ dsflow/
     ├── dataset.py    # 比例时长对齐数据集 + collate
     └── prepare.py    # 预处理 CLI
 ```
+
+`dsflow/chatterbox/`：Chatterbox S3Gen 单步化（教师/学生模型、蒸馏、评估、TTS demo）。
 
 ## Known limitations & next steps
 
