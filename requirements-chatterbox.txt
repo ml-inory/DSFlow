@@ -1,0 +1,7 @@
+# Chatterbox S3Gen one-step distillation dependencies.
+# Install chatterbox source WITHOUT its pinned deps (it pins torch==2.6 / transformers==5.2):
+#   pip install --no-deps git+https://github.com/Resemble-AI/chatterbox.git@master
+s3tokenizer
+conformer
+perth
+pyloudnorm
