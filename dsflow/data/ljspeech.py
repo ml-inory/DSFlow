@@ -5,6 +5,7 @@ from __future__ import annotations
 import json
 import tarfile
 import urllib.request
+from concurrent.futures import ProcessPoolExecutor
 from pathlib import Path
 from typing import List, Optional
 
@@ -40,11 +41,23 @@ def ensure_ljspeech(cfg: DataConfig) -> Path:
     return lj_dir
 
 
+def _preprocess_item(args: tuple[str, DataConfig]):
+    """Worker: load wav and compute mel; returns None for out-of-range clips."""
+    wav_path, cfg = args
+    wave = load_wav(wav_path, cfg.mel.sample_rate)
+    seconds = wave.numel() / cfg.mel.sample_rate
+    if not (cfg.min_seconds <= seconds <= cfg.max_seconds):
+        return None
+    mel = mel_spectrogram(wave, cfg.mel)
+    return {"mel": mel.cpu(), "mel_len": int(mel.size(-1))}
+
+
 def preprocess_ljspeech(
     cfg: DataConfig,
     tokenizer: TextTokenizer,
     force: bool = False,
     max_files: Optional[int] = None,
+    workers: int = 1,
 ) -> List[dict]:
     """Preprocess LJSpeech into cached per-utterance mel files plus metadata.json."""
     lj_dir = ensure_ljspeech(cfg)
@@ -59,25 +72,33 @@ def preprocess_ljspeech(
     if max_files is not None:
         lines = lines[:max_files]
 
-    records = []
-    for line in tqdm(lines, desc="Preprocessing LJSpeech"):
+    rows = []
+    for line in lines:
         fid, _, text = line.split("|", 2)
-        wav_path = lj_dir / "wavs" / f"{fid}.wav"
-        wave = load_wav(wav_path, cfg.mel.sample_rate)
-        seconds = wave.numel() / cfg.mel.sample_rate
-        if not (cfg.min_seconds <= seconds <= cfg.max_seconds):
+        rows.append((fid, str(lj_dir / "wavs" / f"{fid}.wav"), text))
+    tokens = [tokenizer.encode(text) for _, _, text in rows]
+
+    tasks = [(wav_path, cfg) for _, wav_path, _ in rows]
+    if workers > 1:
+        with ProcessPoolExecutor(max_workers=workers) as executor:
+            results = executor.map(_preprocess_item, tasks, chunksize=8)
+    else:
+        results = map(_preprocess_item, tasks)
+
+    records = []
+    for (fid, _, utterance_text), item_tokens, result in zip(tqdm(rows, desc="Preprocessing LJSpeech"), tokens, results):
+        if result is None:
             continue
-        mel = mel_spectrogram(wave, cfg.mel)
-        tokens = tokenizer.encode(text)
+        mel = result["mel"]
         torch_save_path = mel_dir / f"{fid}.pt"
         torch_save({"mel": mel}, torch_save_path)
         records.append(
             {
                 "id": fid,
-                "text": text,
-                "tokens": tokens,
-                "text_len": len(tokens),
-                "mel_len": mel.size(-1),
+                "text": utterance_text,
+                "tokens": item_tokens,
+                "text_len": len(item_tokens),
+                "mel_len": result["mel_len"],
                 "mel_path": str(torch_save_path),
             }
         )

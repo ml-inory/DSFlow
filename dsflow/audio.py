@@ -27,7 +27,11 @@ def load_wav(path, sample_rate: int) -> torch.Tensor:
 
 @torch.inference_mode()
 def mel_spectrogram(wave: torch.Tensor, cfg: MelConfig) -> torch.Tensor:
-    """Compute log10 mel power spectrogram of shape [n_mels, T]."""
+    """Compute log10 mel spectrogram (magnitude, slaney scale) of shape [n_mels, T].
+
+    The magnitude + slaney parameterization matches the mel features used by
+    the HiFi-GAN (jik876-style) and torchaudio Griffin-Lim vocoders.
+    """
     wav = wave.float()
     if wav.dim() == 1:
         wav = wav.unsqueeze(0)
@@ -41,16 +45,18 @@ def mel_spectrogram(wave: torch.Tensor, cfg: MelConfig) -> torch.Tensor:
         center=True,
         return_complex=True,
     )
-    power = spec.abs().pow(2)  # [1, F, T]
+    magnitude = spec.abs()  # [1, F, T]
     fbanks = taf.melscale_fbanks(
         n_freqs=cfg.n_fft // 2 + 1,
         f_min=cfg.f_min,
         f_max=cfg.f_max,
         n_mels=cfg.n_mels,
         sample_rate=cfg.sample_rate,
+        norm="slaney",
+        mel_scale="slaney",
     ).to(wav.device)
-    mel = torch.matmul(fbanks.T, power)  # [1, M, T]
-    return torch.log10(torch.clamp(mel, min=1e-10)).squeeze(0)
+    mel = torch.matmul(fbanks.T, magnitude)  # [1, M, T]
+    return torch.log10(torch.clamp(mel, min=1e-5)).squeeze(0)
 
 
 def save_wav(path, wave: torch.Tensor, sample_rate: int) -> None:
