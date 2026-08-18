@@ -21,12 +21,14 @@ from torch.utils.data import DataLoader, Dataset
 from tqdm import tqdm
 
 from dsflow.chatterbox.data import ChatterboxDataConfig, load_record, prepare_records
-from dsflow.chatterbox.model import OneStepS3Gen, flow_conditions, load_teacher, teacher_endpoint
+from dsflow.chatterbox.model import OneStepS3Gen, flow_conditions, load_teacher, teacher_euler, teacher_euler_plain
 
 
 class RecordDataset(Dataset):
-    def __init__(self, records):
+    def __init__(self, records, max_mel_len=None):
         self.records = records
+        if max_mel_len is not None:
+            self.records = [r for r in records if r["mel_len"] <= max_mel_len]
 
     def __len__(self):
         return len(self.records)
@@ -39,8 +41,10 @@ class PairDataset(Dataset):
     """Precomputed (z, x1_teacher) distillation pairs."""
 
     def __init__(self, records, pairs_dir: str):
-        self.records = records
         self.pairs_dir = Path(pairs_dir)
+        self.records = [
+            r for r in records if (self.pairs_dir / "z" / f"{r['id']}.pt").exists()
+        ]
 
     def __len__(self):
         return len(self.records)
@@ -92,17 +96,18 @@ def sample_t(batch_size, step_dropout, device):
     t = torch.rand(batch_size, device=device)
     if step_dropout > 0:
         drop = torch.rand(batch_size, device=device) < step_dropout
-        t = torch.where(drop, torch.ones_like(t), t)
+        # S3Gen CFM convention: t=0 is pure noise = the one-step inference input.
+        t = torch.where(drop, torch.zeros_like(t), t)
     return t
 
 
 def masked_mse(pred, target, mask):
-    denom = mask.sum().clamp(min=1)
+    denom = (mask.sum() * pred.size(1)).clamp(min=1)
     return ((pred - target).pow(2) * mask).sum() / denom
 
 
 def masked_l1(pred, target, mask):
-    denom = mask.sum().clamp(min=1)
+    denom = (mask.sum() * pred.size(1)).clamp(min=1)
     return ((pred - target).abs() * mask).sum() / denom
 
 
@@ -118,12 +123,12 @@ def distill(args) -> list[float]:
     records = prepare_records(ChatterboxDataConfig(out_dir=args.records_dir), teacher, max_files=args.max_files, device=device)
     if args.max_files:
         records = records[: args.max_files]
-    use_pairs = Path(args.pairs_dir).exists() and Path(args.pairs_dir, "index.json").exists()
+    use_pairs = (not args.fresh_z) and Path(args.pairs_dir).exists() and Path(args.pairs_dir, "index.json").exists()
     if use_pairs:
         dataset = PairDataset(records, args.pairs_dir)
         collate_fn = collate_pairs
     else:
-        dataset = RecordDataset(records)
+        dataset = RecordDataset(records, max_mel_len=args.max_mel_len)
         collate_fn = collate
     loader = DataLoader(dataset, batch_size=args.batch_size, shuffle=True, collate_fn=collate_fn, drop_last=True)
 
@@ -161,7 +166,10 @@ def distill(args) -> list[float]:
             mu_t, mask_t, spks_t, conds_t, _, _ = flow_conditions(teacher.flow, tokens, token_len, ref)
             z = torch.randn_like(mu)
             with torch.no_grad():
-                x1_teach = teacher_endpoint(teacher.flow.decoder, mu_t, mask_t, spks_t, conds_t, z, args.teacher_steps)
+                if args.teacher_cfg:
+                    x1_teach = teacher_euler(teacher.flow.decoder, mu_t, mask_t, spks_t, conds_t, z, args.teacher_steps)
+                else:
+                    x1_teach = teacher_euler_plain(teacher.flow.decoder, mu_t, mask_t, spks_t, conds_t, z, args.teacher_steps)
 
         t = sample_t(tokens.size(0), args.step_dropout, device)
         x_t = (1 - t.view(-1, 1, 1)) * z + t.view(-1, 1, 1) * x1_teach
@@ -198,6 +206,9 @@ def main() -> None:
     parser.add_argument("--ckpt-dir", default="data/chatterbox")
     parser.add_argument("--records-dir", default="data/chatterbox/records")
     parser.add_argument("--pairs-dir", default="data/chatterbox/pairs")
+    parser.add_argument("--fresh-z", action="store_true", help="sample fresh noise per step with online teacher")
+    parser.add_argument("--teacher-cfg", action="store_true", help="use CFG-blended teacher endpoints")
+    parser.add_argument("--max-mel-len", type=int, default=800, help="cap training clip length (mel frames)")
     parser.add_argument("--out-dir", default="checkpoints/chatterbox")
     parser.add_argument("--steps", type=int, default=1500)
     parser.add_argument("--batch-size", type=int, default=4)

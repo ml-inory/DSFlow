@@ -11,7 +11,7 @@ import torch
 
 from dsflow.audio import save_wav
 from dsflow.chatterbox.data import ChatterboxDataConfig, load_record, prepare_records
-from dsflow.chatterbox.model import OneStepS3Gen, flow_conditions, load_teacher, teacher_endpoint
+from dsflow.chatterbox.model import OneStepS3Gen, flow_conditions, load_teacher, teacher_euler
 from chatterbox.models.s3gen import S3GEN_SR
 
 
@@ -53,23 +53,18 @@ def run_eval(args) -> dict:
         t0 = torch.cuda.Event(enable_timing=True)
         t1 = torch.cuda.Event(enable_timing=True)
         t0.record()
-        mel10 = teacher_endpoint(teacher.flow.decoder, mu_t, mask_t, spks_t, conds_t, z, 10)[:, :, mel_len1:]
+        mel10 = teacher_euler(teacher.flow.decoder, mu_t, mask_t, spks_t, conds_t, z, 10)[:, :, mel_len1:]
         t1.record()
         torch.cuda.synchronize()
         time10 = t0.elapsed_time(t1) / 1000.0
 
         t0.record()
-        mel1_student = student.one_step(tokens, token_len, ref, z, t=1.0)
+        mel1_student = student.one_step(tokens, token_len, ref, z)
         t1.record()
         torch.cuda.synchronize()
         time1 = t0.elapsed_time(t1) / 1000.0
 
-        # teacher direct 1-step Euler (velocity at t=0)
-        t_span = torch.linspace(0, 1, 2, device=device, dtype=z.dtype)
-        if teacher.flow.decoder.t_scheduler == "cosine":
-            t_span = 1 - torch.cos(t_span * 0.5 * torch.pi)
-        v0 = teacher.flow.decoder.estimator(z, mask_t, mu_t, t_span[0].reshape(1), spks_t, conds_t)
-        mel1_teacher = (z + (t_span[1] - t_span[0]) * v0)[:, :, mel_len1:]
+        mel1_teacher = teacher_euler(teacher.flow.decoder, mu_t, mask_t, spks_t, conds_t, z, 1)[:, :, mel_len1:]
 
         results.append(
             {

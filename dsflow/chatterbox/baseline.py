@@ -9,7 +9,7 @@ from pathlib import Path
 import torch
 
 from dsflow.chatterbox.data import ChatterboxDataConfig, load_record, prepare_records
-from dsflow.chatterbox.model import flow_conditions, load_teacher, teacher_endpoint
+from dsflow.chatterbox.model import flow_conditions, load_teacher, teacher_euler
 from dsflow.config import DataConfig
 from dsflow.data.ljspeech import ensure_ljspeech
 
@@ -47,7 +47,7 @@ def run_baseline(ckpt_dir, records_dir, max_clips=40, device="cuda", seed=0):
         t0 = torch.cuda.Event(enable_timing=True)
         t1 = torch.cuda.Event(enable_timing=True)
         t0.record()
-        mel10 = teacher_endpoint(cfm, mu, mask, spks, conds, z, n_timesteps=10)[:, :, mel_len1:]
+        mel10 = teacher_euler(cfm, mu, mask, spks, conds, z, n_timesteps=10)[:, :, mel_len1:]
         t1.record()
         torch.cuda.synchronize()
         time10 = t0.elapsed_time(t1) / 1000.0
@@ -56,8 +56,7 @@ def run_baseline(ckpt_dir, records_dir, max_clips=40, device="cuda", seed=0):
         t_span = torch.linspace(0, 1, 2, device=device, dtype=z.dtype)
         if cfm.t_scheduler == "cosine":
             t_span = 1 - torch.cos(t_span * 0.5 * torch.pi)
-        v0 = cfm.estimator(z, mask, mu, t_span[0].reshape(1), spks, conds)
-        mel1 = (z + (t_span[1] - t_span[0]) * v0)[:, :, mel_len1:]
+        mel1 = teacher_euler(cfm, mu, mask, spks, conds, z, n_timesteps=1)[:, :, mel_len1:]
 
         metrics.append(
             {

@@ -12,7 +12,7 @@ import torch
 from tqdm import tqdm
 
 from dsflow.chatterbox.data import ChatterboxDataConfig, load_record, prepare_records
-from dsflow.chatterbox.model import flow_conditions, load_teacher, teacher_endpoint
+from dsflow.chatterbox.model import flow_conditions, load_teacher, teacher_euler
 
 
 def worker(rank: int, records, out_dir: str, ckpt_dir: str, device: str, seed: int) -> int:
@@ -32,7 +32,7 @@ def worker(rank: int, records, out_dir: str, ckpt_dir: str, device: str, seed: i
             teacher.flow, data["tokens"], data["token_len"], {"embedding": data["embedding"]}
         )
         z = torch.randn_like(mu)
-        x1 = teacher_endpoint(teacher.flow.decoder, mu, mask, spks, conds, z, 10)
+        x1 = teacher_euler(teacher.flow.decoder, mu, mask, spks, conds, z, 10)
         torch.save({"z": z.cpu()}, z_path)
         torch.save({"x1": x1[:, :, mel_len1:].cpu()}, out / "x1" / f"{rec['id']}.pt")
         done += 1

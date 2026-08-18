@@ -80,7 +80,8 @@ def prepare_records(cfg: ChatterboxDataConfig, teacher, max_files=None, device="
                 "emb_path": str(emb_dir / f"{fid}.pt"),
             }
         )
-    index_path.write_text(json.dumps(records))
+    if max_files is None:
+        index_path.write_text(json.dumps(records))
     return records
 
 

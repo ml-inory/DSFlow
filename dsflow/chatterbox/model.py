@@ -165,7 +165,7 @@ class OneStepS3Gen(nn.Module):
         return flow_conditions(self.flow, tokens, token_len, ref_dict)
 
     @torch.inference_mode()
-    def one_step(self, tokens, token_len, ref_dict, z, t: float = 1.0) -> torch.Tensor:
+    def one_step(self, tokens, token_len, ref_dict, z, t: float = 0.0) -> torch.Tensor:
         """Single-step synthesis via the x0 head: returns the generated mel region."""
         mu, mask, spks, conds, mel_len1, _ = self._conditions(tokens, token_len, ref_dict)
         t_tensor = torch.full((tokens.size(0),), t, device=z.device, dtype=z.dtype)
@@ -173,21 +173,62 @@ class OneStepS3Gen(nn.Module):
         return x0[:, :, mel_len1:]
 
     @torch.inference_mode()
-    def euler(self, tokens, token_len, ref_dict, z, steps: int, t_start: float = 1.0) -> torch.Tensor:
+    def euler(self, tokens, token_len, ref_dict, z, steps: int) -> torch.Tensor:
         """Multi-step synthesis via the velocity head (Euler)."""
         mu, mask, spks, conds, mel_len1, _ = self._conditions(tokens, token_len, ref_dict)
         x = z
+        dt = 1.0 / steps
         for i in range(steps):
-            t = t_start - (t_start / steps) * i
-            t_tensor = torch.full((tokens.size(0),), t, device=z.device, dtype=z.dtype)
+            t_tensor = torch.full((tokens.size(0),), (i + 0.5) * dt, device=z.device, dtype=z.dtype)
             v, _ = self.flow.decoder.estimator(x, mask, mu, t_tensor, spks, conds)
-            x = x - (t_start / steps) * v
+            x = x + dt * v
         return x[:, :, mel_len1:]
 
 
 @torch.inference_mode()
-def teacher_endpoint(cfm: CausalConditionalCFM, mu, mask, spks, cond, z, n_timesteps=10):
-    """Solve the teacher CFM ODE from *z* with Euler steps (cosine schedule)."""
+def teacher_euler(cfm: CausalConditionalCFM, mu, mask, spks, cond, z, n_timesteps=10):
+    """Solve the teacher CFM ODE from *z*, matching the official inference path.
+
+    Mirrors ``CausalConditionalCFM.solve_euler``: cosine time schedule, CFG-style
+    duplicated batch (conditioned + unconditioned) and blending with
+    ``inference_cfg_rate``.
+    """
+    in_dtype = z.dtype
+    est_dtype = cfm.estimator.dtype
+    z = z.to(est_dtype)
+    mu = mu.to(est_dtype)
+    spks = spks.to(est_dtype)
+    cond = cond.to(est_dtype)
+
+    t_span = torch.linspace(0, 1, n_timesteps + 1, device=z.device, dtype=z.dtype)
+    if cfm.t_scheduler == "cosine":
+        t_span = 1 - torch.cos(t_span * 0.5 * torch.pi)
+    x = z
+    B = mu.size(0)
+    zeros_mu, zeros_spks, zeros_cond = torch.zeros_like(mu), torch.zeros_like(spks), torch.zeros_like(cond)
+    for t, r in zip(t_span[:-1], t_span[1:]):
+        t_t = t.reshape(1).to(est_dtype)
+        dxdt_all = cfm.estimator(
+            torch.cat([x, x], dim=0),
+            torch.cat([mask, mask], dim=0),
+            torch.cat([mu, zeros_mu], dim=0),
+            torch.cat([t_t, t_t], dim=0),
+            torch.cat([spks, zeros_spks], dim=0),
+            torch.cat([cond, zeros_cond], dim=0),
+        )
+        dxdt, cfg_dxdt = dxdt_all.split(B, dim=0)
+        cfg = cfm.inference_cfg_rate
+        dxdt = (1.0 + cfg) * dxdt - cfg * cfg_dxdt
+        x = x + (r - t) * dxdt
+    return x.to(in_dtype)
+
+
+teacher_endpoint = teacher_euler  # back-compat alias
+
+
+@torch.inference_mode()
+def teacher_euler_plain(cfm: CausalConditionalCFM, mu, mask, spks, cond, z, n_timesteps=10):
+    """Teacher Euler with a single conditioned pass per step (no CFG blending)."""
     in_dtype = z.dtype
     est_dtype = cfm.estimator.dtype
     z = z.to(est_dtype)
