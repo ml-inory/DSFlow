@@ -5,7 +5,7 @@ from __future__ import annotations
 import argparse
 
 from dsflow.config import DataConfig
-from dsflow.data.ljspeech import preprocess_ljspeech
+from dsflow.data.ljspeech import ensure_ljspeech, preprocess_ljspeech
 from dsflow.train import build_tokenizer, metadata_texts
 
 
@@ -19,6 +19,7 @@ def main() -> None:
     args = parser.parse_args()
 
     cfg = DataConfig(data_root=args.data_root, cache_dir=args.cache_dir, use_phonemes=not args.no_phonemes)
+    ensure_ljspeech(cfg)
     tokenizer = build_tokenizer(cfg, metadata_texts(cfg))
     records = preprocess_ljspeech(cfg, tokenizer, max_files=args.max_files, workers=args.workers)
     print(f"[prepare] {len(records)} utterances, vocab={tokenizer.vocab_size}")

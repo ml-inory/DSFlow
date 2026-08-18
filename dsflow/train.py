@@ -13,7 +13,7 @@ from torch.utils.data import DataLoader
 from tqdm import tqdm
 
 from dsflow.config import DataConfig, MelConfig, ModelConfig, TrainConfig
-from dsflow.data import MelDataset, collate_mel, preprocess_ljspeech
+from dsflow.data import MelDataset, collate_mel, ensure_ljspeech, preprocess_ljspeech
 from dsflow.losses import dual_supervision_loss, duration_loss
 from dsflow.model import DSFlow
 from dsflow.text import TextTokenizer
@@ -32,9 +32,15 @@ def build_tokenizer(data_cfg: DataConfig, texts: list[str]) -> TextTokenizer:
     cache.mkdir(parents=True, exist_ok=True)
     vocab_path = cache / "vocab.json"
     if vocab_path.exists():
-        return TextTokenizer.load(vocab_path)
-    tokenizer = TextTokenizer.from_corpus(texts, use_phonemes=data_cfg.use_phonemes)
-    tokenizer.save(vocab_path)
+        tokenizer = TextTokenizer.load(vocab_path)
+    else:
+        tokenizer = TextTokenizer.from_corpus(texts, use_phonemes=data_cfg.use_phonemes)
+        tokenizer.save(vocab_path)
+    if tokenizer.vocab_size <= 5:
+        raise ValueError(
+            f"tokenizer vocabulary is empty ({tokenizer.vocab_size} symbols); "
+            "LJSpeech texts were not available when building the vocab — delete data/cache and retry"
+        )
     return tokenizer
 
 
@@ -52,6 +58,7 @@ def train(data_cfg: DataConfig, model_cfg: ModelConfig, train_cfg: TrainConfig) 
     random.seed(train_cfg.seed)
     device = torch.device(train_cfg.device if torch.cuda.is_available() else "cpu")
 
+    ensure_ljspeech(data_cfg)
     texts = metadata_texts(data_cfg)
     tokenizer = build_tokenizer(data_cfg, texts)
     records = preprocess_ljspeech(data_cfg, tokenizer, max_files=None)

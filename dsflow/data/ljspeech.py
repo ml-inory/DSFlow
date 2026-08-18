@@ -3,12 +3,15 @@
 from __future__ import annotations
 
 import json
+import multiprocessing
+import os
 import tarfile
 import urllib.request
 from concurrent.futures import ProcessPoolExecutor
 from pathlib import Path
 from typing import List, Optional
 
+import torch
 from tqdm import tqdm
 
 from dsflow.audio import load_wav, mel_spectrogram
@@ -43,6 +46,8 @@ def ensure_ljspeech(cfg: DataConfig) -> Path:
 
 def _preprocess_item(args: tuple[str, DataConfig]):
     """Worker: load wav and compute mel; returns None for out-of-range clips."""
+    os.environ.setdefault("OMP_NUM_THREADS", "1")
+    torch.set_num_threads(1)
     wav_path, cfg = args
     wave = load_wav(wav_path, cfg.mel.sample_rate)
     seconds = wave.numel() / cfg.mel.sample_rate
@@ -80,7 +85,8 @@ def preprocess_ljspeech(
 
     tasks = [(wav_path, cfg) for _, wav_path, _ in rows]
     if workers > 1:
-        with ProcessPoolExecutor(max_workers=workers) as executor:
+        ctx = multiprocessing.get_context("spawn")
+        with ProcessPoolExecutor(max_workers=workers, mp_context=ctx) as executor:
             results = executor.map(_preprocess_item, tasks, chunksize=8)
     else:
         results = map(_preprocess_item, tasks)
@@ -107,6 +113,4 @@ def preprocess_ljspeech(
 
 
 def torch_save(obj, path: Path) -> None:
-    import torch
-
     torch.save(obj, path)
