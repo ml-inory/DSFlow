@@ -111,6 +111,61 @@ def masked_l1(pred, target, mask):
     return ((pred - target).abs() * mask).sum() / denom
 
 
+def masked_band_level_loss(pred, target, mask, eps=1e-8):
+    """Per-band mean log-magnitude (level) matching, masked over time.
+
+    The S3Gen mel features are log10 magnitudes, so the *linear* magnitude of
+    each band is averaged over time and compared in log10 space. This directly
+    penalizes systematic level/tilt deficits (e.g. the one-step student being
+    quieter than the teacher), which plain L1 on log-mel only weakly constrains
+    when the direct head is far from converged.
+    """
+    num = mask.sum(dim=-1).clamp(min=1)
+    p_band = ((10.0 ** pred.clamp(max=10.0) * mask).sum(dim=-1) / num + eps).log10()
+    t_band = ((10.0 ** target.clamp(max=10.0) * mask).sum(dim=-1) / num + eps).log10()
+    return ((p_band - t_band) ** 2).mean()
+
+
+def vocode_mel(mel, vocoder):
+    """Differentiable vocoding of (B, 80, T) mel through the frozen HiFT vocoder.
+
+    Mirrors ``HiFT.inference`` but without ``torch.inference_mode`` so gradients
+    can flow back into the predicted mel.
+    """
+    f0 = vocoder.f0_predictor(mel)  # (B, T)
+    s = vocoder.f0_upsamp(f0[:, None]).transpose(1, 2)  # (B, T', 1)
+    s, _, _ = vocoder.m_source(s)
+    s = s.transpose(1, 2)  # (B, 1, T'), matching HiFT.inference
+    return vocoder.decode(x=mel, s=s)
+
+
+def multi_scale_stft_loss(pred, target, fft_sizes=(256, 512, 1024, 2048, 4096), eps=1e-5):
+    """Multi-scale STFT loss (L1 + log-magnitude L1 + spectral convergence).
+
+    The 4096-pt scale resolves the F0/harmonic region (~5.9 Hz bins), which is
+    where the one-step student is still audibly rougher than the teacher; the
+    256-pt scale captures transient detail. Spectral convergence
+    (||X-Y||_F / ||Y||_F) is scale-invariant and sharpens shape matching.
+    """
+    loss = torch.zeros((), device=pred.device)
+    for fft in fft_sizes:
+        hop = fft // 4
+        window = torch.hann_window(fft, device=pred.device)
+        x_mag = torch.stft(pred, fft, hop, fft, window=window, return_complex=True).abs()
+        y_mag = torch.stft(target, fft, hop, fft, window=window, return_complex=True).abs()
+        loss = loss + (x_mag - y_mag).abs().mean()
+        loss = loss + (torch.log(x_mag + eps) - torch.log(y_mag + eps)).abs().mean()
+        loss = loss + (x_mag - y_mag).pow(2).sum() / (y_mag.pow(2).sum() + eps)
+    return loss / len(fft_sizes)
+
+
+def wav_level_loss(pred, target, eps=1e-8):
+    """Log-RMS level matching of the vocoded waveforms (in dB-ish units)."""
+    rp = (pred.pow(2).mean(dim=-1) + eps).log10()
+    rt = (target.pow(2).mean(dim=-1) + eps).log10()
+    return (rp - rt).abs().mean()
+
+
 def distill(args) -> list[float]:
     torch.manual_seed(args.seed)
     random.seed(args.seed)
@@ -132,6 +187,20 @@ def distill(args) -> list[float]:
         collate_fn = collate
     loader = DataLoader(dataset, batch_size=args.batch_size, shuffle=True, collate_fn=collate_fn, drop_last=True)
 
+    prompt_ref = None
+    if args.prompt_mix > 0.0:
+        from chatterbox.tts import Conditionals
+
+        conds = Conditionals.load(Path(args.ckpt_dir) / "conds.pt", map_location="cpu")
+        prompt_ref = {
+            "embedding": conds.gen["embedding"],
+            "prompt_token": conds.gen["prompt_token"],
+            "prompt_token_len": conds.gen["prompt_token_len"],
+            "prompt_feat": conds.gen["prompt_feat"],
+        }
+        print(f"[distill] prompt-mix enabled ({args.prompt_mix}); built-in prompt: "
+              f"{prompt_ref['prompt_token'].size(-1)} tokens, {prompt_ref['prompt_feat'].size(-2)} mel frames")
+
     optimizer = torch.optim.AdamW(student.flow.parameters(), lr=args.lr, weight_decay=args.wd)
     out_dir = Path(args.out_dir)
     out_dir.mkdir(parents=True, exist_ok=True)
@@ -141,6 +210,8 @@ def distill(args) -> list[float]:
         state = torch.load(last_ckpt, map_location=device, weights_only=True)
         student.load_state_dict(state["student"])
         optimizer.load_state_dict(state["optimizer"])
+        for g in optimizer.param_groups:
+            g["lr"] = args.lr
         step = state["step"]
         print(f"[distill] resumed from step {step}")
 
@@ -156,7 +227,17 @@ def distill(args) -> list[float]:
 
         tokens = batch["tokens"].to(device)
         token_len = batch["token_len"].to(device)
-        ref = {"embedding": batch["embedding"].to(device)}
+        use_prompt = prompt_ref is not None and random.random() < args.prompt_mix
+        if use_prompt:
+            bsz = tokens.size(0)
+            ref = {
+                "embedding": prompt_ref["embedding"].expand(bsz, -1).to(device),
+                "prompt_token": prompt_ref["prompt_token"].expand(bsz, -1).to(device),
+                "prompt_token_len": prompt_ref["prompt_token_len"].expand(bsz).to(device),
+                "prompt_feat": prompt_ref["prompt_feat"].expand(bsz, -1, -1).to(device),
+            }
+        else:
+            ref = {"embedding": batch["embedding"].to(device)}
         mu, mask, spks, conds, mel_len1, mel_len2 = flow_conditions(student.flow, tokens, token_len, ref)
 
         if use_pairs:
@@ -180,7 +261,27 @@ def distill(args) -> list[float]:
             gen_mask[:, :, :mel_len1] = False
         loss_cfm = masked_mse(v_pred[:, :, mel_len1:], (x1_teach - z)[:, :, mel_len1:], gen_mask[:, :, mel_len1:])
         loss_direct = masked_l1(x0_pred[:, :, mel_len1:], x1_teach[:, :, mel_len1:], gen_mask[:, :, mel_len1:])
-        loss = loss_cfm + args.lambda_direct * loss_direct
+        loss_band = masked_band_level_loss(x0_pred[:, :, mel_len1:], x1_teach[:, :, mel_len1:], gen_mask[:, :, mel_len1:])
+        loss = loss_cfm + args.lambda_direct * loss_direct + args.lambda_band * loss_band
+        loss_stft = torch.zeros((), device=device)
+        if args.lambda_stft > 0:
+            gen = x0_pred[:, :, mel_len1:]
+            gen_t = x1_teach[:, :, mel_len1:]
+            if gen.size(-1) >= 40:  # >= 0.8 s, enough for the 2048-pt STFT window
+                for p in teacher.mel2wav.parameters():
+                    p.requires_grad_(False)
+                wav_pred = vocode_mel(gen, teacher.mel2wav)
+                with torch.no_grad():
+                    wav_t = vocode_mel(gen_t, teacher.mel2wav)
+                if args.lambda_level > 0:
+                    loss = loss + args.lambda_level * wav_level_loss(wav_pred, wav_t)
+                if args.stft_crop_frames > 0 and gen.size(-1) > args.stft_crop_frames:
+                    start = random.randint(0, gen.size(-1) - args.stft_crop_frames)
+                    s0 = start * 480
+                    wav_pred = wav_pred[:, s0:s0 + args.stft_crop_frames * 480]
+                    wav_t = wav_t[:, s0:s0 + args.stft_crop_frames * 480]
+                loss_stft = multi_scale_stft_loss(wav_pred, wav_t)
+                loss = loss + args.lambda_stft * loss_stft
 
         optimizer.zero_grad()
         loss.backward()
@@ -191,7 +292,13 @@ def distill(args) -> list[float]:
         step += 1
         pbar.update(1)
         if step % args.log_every == 0:
-            pbar.set_postfix(loss=f"{loss.item():.4f}", cfm=f"{loss_cfm.item():.4f}", direct=f"{loss_direct.item():.4f}")
+            pbar.set_postfix(
+                loss=f"{loss.item():.4f}",
+                cfm=f"{loss_cfm.item():.4f}",
+                direct=f"{loss_direct.item():.4f}",
+                band=f"{loss_band.item():.4f}",
+                stft=f"{loss_stft.item():.4f}",
+            )
         if step % args.ckpt_every == 0 or step == args.steps:
             torch.save(
                 {"step": step, "student": student.state_dict(), "optimizer": optimizer.state_dict(), "args": vars(args)},
@@ -217,6 +324,11 @@ def main() -> None:
     parser.add_argument("--teacher-steps", type=int, default=10)
     parser.add_argument("--step-dropout", type=float, default=0.2)
     parser.add_argument("--lambda-direct", type=float, default=1.0)
+    parser.add_argument("--lambda-band", type=float, default=1.0, help="weight of per-band log-magnitude level loss")
+    parser.add_argument("--lambda-stft", type=float, default=0.0, help="weight of multi-scale STFT loss on vocoded waveform")
+    parser.add_argument("--lambda-level", type=float, default=0.0, help="weight of vocoded-waveform log-RMS level loss")
+    parser.add_argument("--stft-crop-frames", type=int, default=160, help="random mel-frame crop for the STFT loss (0 = full sequence)")
+    parser.add_argument("--prompt-mix", type=float, default=0.0, help="probability per batch of conditioning with the built-in voice prompt (demo path)")
     parser.add_argument("--log-every", type=int, default=20)
     parser.add_argument("--ckpt-every", type=int, default=500)
     parser.add_argument("--max-files", type=int, default=None)
