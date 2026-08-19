@@ -116,12 +116,43 @@ python -m dsflow.infer --ckpt checkpoints/last.pt --text "..." --out outputs/mul
   ```bash
   pip install --no-deps git+https://github.com/Resemble-AI/chatterbox.git@master
   pip install -r requirements-chatterbox.txt
-  python -m dsflow.chatterbox.distill --fresh-z --steps 2000 --step-dropout 0.5 --lambda-direct 1.5 --teacher-steps 5
+  python -m dsflow.chatterbox.distill --fresh-z --steps 12000 --step-dropout 0.5 \
+    --lambda-direct 1.5 --lambda-band 2.0 --lambda-stft 2.0 --lambda-level 1.0 \
+    --prompt-mix 0.7 --teacher-steps 5 --lr 2e-5
   python -m dsflow.chatterbox.eval --student-ckpt checkpoints/chatterbox/last.pt
   python -m dsflow.chatterbox.demo_tts   # 端到端：教师 10 步 vs 学生 1 步 WAV
   ```
-- **已知限制**：学生单步 mel 指标优于教师，但经 HiFT 合成时整体响度偏低（demo 已做响度归一化）；阶段 2（ONNX/AXMODEL 上板）待验证通过后另行开展。
 
+#### 蒸馏微创新：波形域多尺度 STFT loss
+
+纯 mel 域 L1/CFM 收敛后，学生单步 mel 谱形已接近教师（corr ≈ 0.89），但经 HiFT 声码器合成后波形仍明显"毛糙"：
+浊音帧强周期比例仅 6%（教师 44%）、整体电平低 5.6x、高频（12k+）能量缺 ~3.8x，听感上"不像同一音色且有噪音"。
+原因是 mel 域损失天然偏向平均/平滑解，管不到最终波形的谐波细节。
+
+做法（`dsflow/chatterbox/distill.py`）：
+
+- **可微声码器前向 `vocode_mel`**：复刻 `HiFT.inference`（mel→f0→source→decode）但不带 `torch.inference_mode`，
+  冻结教师声码器参数，让梯度穿过声码器直达学生 mel——损失直接作用在"最终听到的波形"上；
+- **多尺度 STFT loss**（256/512/1024/2048/4096 五尺度，hop=fft/4）：每尺度 L1 + log-幅度 L1 + 谱收敛
+  `||X−Y||_F/||Y||_F`。4096 尺度（~5.9Hz 分辨率）专门抓 F0/谐波区，log-幅度项均衡响亮与微弱频带；
+- **配套项**：`masked_band_level_loss`（80 频带逐带平均 log 幅度对齐，治整体电平/频响塌陷）、
+  `wav_level_loss`（vocoded 波形 log-RMS 对齐，治响度差）、`--prompt-mix`（训练 batch 按概率混入内置音色
+  prompt 条件——真实推理路径带 prompt，纯无 prompt 训练会在此泛化失败）。
+
+效果（demo 句同噪声 A/B，step 12000；留出 20 句）：
+
+  | 指标 | step 2000（原始） | step 12000（+STFT） | 教师 10 步 |
+  | --- | --- | --- | --- |
+  | mel corr vs 教师 | 0.893 | **0.969** | 1.0 |
+  | WAV 电平比（师/学） | 5.6x | **1.15x** | 1.0 |
+  | 浊音帧强周期比例 | 6% | **46%** | 45% |
+  | 留出集 corr / L1 | 0.891 / 0.691 | **0.894 / 0.681** | 0.887 / 0.784 |
+
+上板（Magnetar/AX650C，U8 INT8）：ONNX 对分 cosine 1.0；板端 ax_run_model 3 样本 cosine **0.9932**（旧模型
+0.9876）；板端端到端 181ms/512 帧（RTF 0.0177）。波形级 STFT loss 让 INT8 量化精度也顺带过 0.99 门限。
+
+- **已知限制**：单步学生与教师同噪声下波形样本级相关仍低（~0.04，声码器相位敏感所致，听感已基本一致）；
+  进一步逼近需换谱锐度/谐波约束或上 QAT。
 ## Repository layout
 
 ```text
