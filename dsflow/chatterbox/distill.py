@@ -153,8 +153,12 @@ def multi_scale_stft_loss(pred, target, fft_sizes=(256, 512, 1024, 2048, 4096), 
         window = torch.hann_window(fft, device=pred.device)
         x_mag = torch.stft(pred, fft, hop, fft, window=window, return_complex=True).abs()
         y_mag = torch.stft(target, fft, hop, fft, window=window, return_complex=True).abs()
-        loss = loss + (x_mag - y_mag).abs().mean()
-        loss = loss + (torch.log(x_mag + eps) - torch.log(y_mag + eps)).abs().mean()
+        # 1-8 kHz（辅音/清晰度频带）加权 2x，其余 1x
+        freqs = torch.linspace(0.0, 12000.0, x_mag.size(-2), device=pred.device)
+        w = 1.0 + 1.0 * ((freqs >= 1000.0) & (freqs <= 8000.0)).float()
+        w = w.view(1, -1, 1)
+        loss = loss + ((x_mag - y_mag).abs() * w).mean()
+        loss = loss + ((torch.log(x_mag + eps) - torch.log(y_mag + eps)).abs() * w).mean()
         loss = loss + (x_mag - y_mag).pow(2).sum() / (y_mag.pow(2).sum() + eps)
     return loss / len(fft_sizes)
 
