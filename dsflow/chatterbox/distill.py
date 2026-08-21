@@ -153,8 +153,12 @@ def multi_scale_stft_loss(pred, target, fft_sizes=(256, 512, 1024, 2048, 4096), 
         window = torch.hann_window(fft, device=pred.device)
         x_mag = torch.stft(pred, fft, hop, fft, window=window, return_complex=True).abs()
         y_mag = torch.stft(target, fft, hop, fft, window=window, return_complex=True).abs()
-        loss = loss + (x_mag - y_mag).abs().mean()
-        loss = loss + (torch.log(x_mag + eps) - torch.log(y_mag + eps)).abs().mean()
+        # 1-8 kHz（辅音/清晰度频带）加权 2x，其余 1x
+        freqs = torch.linspace(0.0, 12000.0, x_mag.size(-2), device=pred.device)
+        w = 1.0 + 1.0 * ((freqs >= 1000.0) & (freqs <= 8000.0)).float()
+        w = w.view(1, -1, 1)
+        loss = loss + ((x_mag - y_mag).abs() * w).mean()
+        loss = loss + ((torch.log(x_mag + eps) - torch.log(y_mag + eps)).abs() * w).mean()
         loss = loss + (x_mag - y_mag).pow(2).sum() / (y_mag.pow(2).sum() + eps)
     return loss / len(fft_sizes)
 
@@ -263,6 +267,19 @@ def distill(args) -> list[float]:
         loss_direct = masked_l1(x0_pred[:, :, mel_len1:], x1_teach[:, :, mel_len1:], gen_mask[:, :, mel_len1:])
         loss_band = masked_band_level_loss(x0_pred[:, :, mel_len1:], x1_teach[:, :, mel_len1:], gen_mask[:, :, mel_len1:])
         loss = loss_cfm + args.lambda_direct * loss_direct + args.lambda_band * loss_band
+        loss_zconsist = torch.zeros((), device=device)
+        if args.lambda_zconsist > 0:
+            # z 不变性：同输入两个随机 z 的 t=0 单步输出应一致。
+            # 每步、全 batch 强制（不依赖 step-dropout），直接压制"个别 z 抽到静音"的 z 敏感。
+            t0 = torch.zeros_like(t)
+            _, x0_z1 = student.flow.decoder.estimator(z, mask, mu, t0, spks, conds)
+            z2 = torch.randn_like(z)
+            _, x0_z2 = student.flow.decoder.estimator(z2, mask, mu, t0, spks, conds)
+            loss_zconsist = masked_mse(
+                x0_z1[:, :, mel_len1:], x0_z2[:, :, mel_len1:],
+                gen_mask[:, :, mel_len1:],
+            )
+            loss = loss + args.lambda_zconsist * loss_zconsist
         loss_stft = torch.zeros((), device=device)
         if args.lambda_stft > 0:
             gen = x0_pred[:, :, mel_len1:]
@@ -297,6 +314,7 @@ def distill(args) -> list[float]:
                 cfm=f"{loss_cfm.item():.4f}",
                 direct=f"{loss_direct.item():.4f}",
                 band=f"{loss_band.item():.4f}",
+                zc=f"{loss_zconsist.item():.4f}",
                 stft=f"{loss_stft.item():.4f}",
             )
         if step % args.ckpt_every == 0 or step == args.steps:
@@ -327,6 +345,7 @@ def main() -> None:
     parser.add_argument("--lambda-band", type=float, default=1.0, help="weight of per-band log-magnitude level loss")
     parser.add_argument("--lambda-stft", type=float, default=0.0, help="weight of multi-scale STFT loss on vocoded waveform")
     parser.add_argument("--lambda-level", type=float, default=0.0, help="weight of vocoded-waveform log-RMS level loss")
+    parser.add_argument("--lambda-zconsist", type=float, default=0.0, help="weight of one-step z-invariance consistency loss")
     parser.add_argument("--stft-crop-frames", type=int, default=160, help="random mel-frame crop for the STFT loss (0 = full sequence)")
     parser.add_argument("--prompt-mix", type=float, default=0.0, help="probability per batch of conditioning with the built-in voice prompt (demo path)")
     parser.add_argument("--log-every", type=int, default=20)
